@@ -1,9 +1,13 @@
+import functools
+import inspect
+import time
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
+import aiohttp
+import asyncio
 
 
 # Расчет скользящего среднего
@@ -30,7 +34,39 @@ def analyze_temperature(data):
     return results
 
 
+# Декоратор для измерения времени работы функции, реализуею синхронный и асинхронный режимы
+def measure_time(func):
+    if inspect.iscoroutinefunction(func):
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            start_time = time.perf_counter()
+            result = await func(*args, **kwargs)
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+            if isinstance(result, dict):
+                result['time'] = elapsed_time
+            else:
+                result = {'result': result, 'time': elapsed_time}
+            return result
+        return async_wrapper
+    else:
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            start_time = time.perf_counter()
+            result = func(*args, **kwargs)
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+            # Add execution time to the result
+            if isinstance(result, dict):
+                result['time'] = elapsed_time
+            else:
+                result = {'result': result, 'time': elapsed_time}
+            return result
+        return sync_wrapper
+
+
 # Работа с OpenWeatherMap API
+@measure_time
 def fetch_current_temperature(city, api_key):
     url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&units=metric&appid={api_key}"
     response = requests.get(url)
@@ -41,6 +77,28 @@ def fetch_current_temperature(city, api_key):
         return {"error": "Invalid API key"}
     else:
         return {"error": "Unable to fetch data"}
+
+@measure_time
+async def async_fetch_current_temperature(city, api_key):
+    url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&units=metric&appid={api_key}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return {"temp": data['main']['temp']}
+                elif response.status == 401:
+                    return {"error": "Invalid API key"}
+                else:
+                    return {"error": f"Unable to fetch data, status code: {response.status}"}
+        except aiohttp.ClientError as e:
+            return {"error": f"Network error: {str(e)}"}
+        except asyncio.TimeoutError:
+            return {"error": "Request timed out"}
+
+
+def get_current_temperature_async_wrapper(city, api_key):
+    return asyncio.run(async_fetch_current_temperature(city, api_key))
 
 
 # Streamlit App
@@ -79,12 +137,12 @@ if data_file:
     st.write("### Временной ряд температур с аномалиями")
     plt.figure(figsize=(10, 6))
     plt.plot(city_data['timestamp'], city_data['temperature'], label='Температура')
-    plt.plot(city_data['timestamp'], city_data['moving_average'], label='Скользящее среднее за 30 дней', color='red')
+    plt.plot(city_data['timestamp'], city_data['moving_average'], label='Скользящее среднее за 30 дней', color='orange')
     anomalies = city_data[
         (city_data['temperature'] < city_data['temperature'].mean() - 2 * city_data['temperature'].std()) |
         (city_data['temperature'] > city_data['temperature'].mean() + 2 * city_data['temperature'].std())
         ]
-    plt.scatter(anomalies['timestamp'], anomalies['temperature'], label='Аномалии', color='orange')
+    plt.scatter(anomalies['timestamp'], anomalies['temperature'], label='Аномалии', color='red')
     plt.legend()
     plt.xlabel('Дата')
     plt.ylabel('Температура (°C)')
@@ -100,9 +158,13 @@ if data_file:
 
     # Подключение к OpenWeatherMap API
     st.sidebar.write("### OpenWeatherMap API")
+    async_mode = st.sidebar.checkbox("Асинхронный режим запросов")
     api_key = st.sidebar.text_input("Введите ваш ключ для OpenWeatherMap API")
     if api_key:
-        response = fetch_current_temperature(selected_city, api_key)
+        if async_mode:
+            response = get_current_temperature_async_wrapper(selected_city, api_key)
+        else:
+            response = fetch_current_temperature(selected_city, api_key)
         if "error" in response:
             st.sidebar.error(response["error"])
         else:
@@ -115,3 +177,4 @@ if data_file:
                 st.sidebar.write("Текущая температура является аномальной для данного сезона.")
             else:
                 st.sidebar.write("Текущая температура в пределах нормы для данного сезона.")
+            st.sidebar.write(f"*Время выполнения запроса к API:* {response['time']:.4f} сек.")
